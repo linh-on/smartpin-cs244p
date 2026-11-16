@@ -1,0 +1,12 @@
+# Build output
+build/
+*.bin
+*.hex
+*.elf
+
+# Secrets (WiFi passwords etc.)
+arduino_secrets.h
+
+# OS / editor
+.DS_Store
+.vscode/
