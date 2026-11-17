@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Trash Can</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <div class="page">
+    <form class="card login-box" method="post">
+      <h1 style="margin-top:0;font-size:22px">Smart Trash Can</h1>
+      <label for="password">Dashboard password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+      {% if error %}<p class="error">{{ error }}</p>{% endif %}
+      <button class="primary" type="submit">Log in</button>
+    </form>
+  </div>
+</body>
+</html>

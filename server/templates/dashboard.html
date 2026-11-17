@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Trash Can</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <h1>Smart Trash Can</h1>
+    <div class="connection">
+      <span class="dot" id="online-dot"></span>
+      <span id="online-text">Waiting for data</span>
+    </div>
+    <form method="post" action="{{ url_for('logout') }}">
+      <button class="link-button" type="submit">Log out</button>
+    </form>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Fill level</h2>
+      <div class="big-number" id="fill-number">--%</div>
+      <div class="meter" aria-hidden="true">
+        <div class="meter-fill" id="fill-meter"></div>
+        <div class="meter-mark" id="fill-mark" title="Full level"></div>
+      </div>
+      <div class="sub" id="fill-sub">Marker shows the full level</div>
+      <div style="margin-top:12px" id="full-badge"></div>
+    </section>
+
+    <section class="card">
+      <h2>Full level (when to warn)</h2>
+      <div class="sub">When the trash reaches this level, the bin shows BIN FULL and beeps.</div>
+      <div class="level-row">
+        <input type="range" id="level-slider" min="10" max="100" step="5" value="80" aria-label="Full level percent">
+        <span class="level-value" id="level-value">80%</span>
+      </div>
+      <div class="level-row">
+        <button class="primary" id="level-save" disabled>Save</button>
+        <span class="sub" id="level-applied"></span>
+      </div>
+      <div class="save-note sub" id="save-note"></div>
+    </section>
+  </div>
+
+  <div class="range-row">
+    <h2>History</h2>
+    <div class="segmented" id="range-picker" role="group" aria-label="Time range">
+      <button data-hours="1">1 h</button>
+      <button data-hours="6">6 h</button>
+      <button data-hours="24" class="selected">24 h</button>
+      <button data-hours="72">72 h</button>
+    </div>
+  </div>
+
+  <section class="card chart-card">
+    <div class="chart-title"><h2>Fill level over time (%)</h2><span class="sub">Dashed line: full level</span></div>
+    <div class="chart" id="fill-chart"></div>
+    <details>
+      <summary>Show as a table</summary>
+      <div class="table-wrap"><table><thead><tr><th>Time</th><th>Fill</th><th>Hand</th><th>Lid</th></tr></thead><tbody id="history-table"></tbody></table></div>
+    </details>
+  </section>
+
+  <section class="card chart-card">
+    <div class="chart-title"><h2>Lid openings</h2><span class="sub" id="opens-bucket-note"></span></div>
+    <div class="chart" id="opens-chart" style="height:180px"></div>
+  </section>
+
+  <section class="card chart-card">
+    <div class="chart-title"><h2>Hand sensor distance (cm)</h2><span class="sub">One reading every 10 s</span></div>
+    <div class="chart" id="hand-chart" style="height:180px"></div>
+  </section>
+
+</div>
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
