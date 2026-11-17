@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <Servo.h>
+#include <WiFiS3.h>
+#include "secrets.h"
 
 const int HAND_TRIG_PIN = 2;
 const int HAND_ECHO_PIN = 3;
@@ -13,17 +15,24 @@ const int LID_STEP_DEGREES = 2;
 const unsigned long LID_STEP_TIME_MS = 15;
 const unsigned long LID_STAY_OPEN_MS = 3000;
 
-const float HAND_OPEN_DISTANCE_CM = 15.0;
+const float HAND_OPEN_DISTANCE_CM = 5.0;
 const unsigned long HAND_CHECK_TIME_MS = 100;
 
-const float EMPTY_BIN_DISTANCE_CM = 30.0;
-const float FULL_BIN_DISTANCE_CM = 5.0;
+const float EMPTY_BIN_DISTANCE_CM = 12.0;
+const float FULL_BIN_DISTANCE_CM = 4.0;
 const unsigned long FILL_CHECK_TIME_MS = 2000;
 const unsigned long LID_SETTLE_TIME_MS = 1000;
 
 const unsigned long ECHO_TIMEOUT_US = 25000;
 const unsigned long QUIET_TIME_MS = 30;
 const unsigned long PRINT_TIME_MS = 1000;
+
+const char DEVICE_ID[] = "bin-1";
+const unsigned long SEND_TIME_MS = 10000;
+const unsigned long WIFI_RETRY_TIME_MS = 30000;
+const unsigned long SERVER_TIMEOUT_MS = 2000;
+const int MAX_LID_OPENS_PER_MESSAGE = 5;
+const int DEFAULT_FULL_LEVEL_PERCENT = 80;
 
 Servo lidServo;
 
@@ -35,6 +44,14 @@ float handDistanceCm = -1;
 float fillDistanceCm = -1;
 int fillPercent = -1;
 
+int fullLevelPercent = DEFAULT_FULL_LEVEL_PERCENT;
+bool binIsFull = false;
+int lidOpensToSend = 0;
+unsigned long messageNumber = 0;
+String bootId;
+bool wifiWasConnected = false;
+bool lastSendWorked = false;
+
 unsigned long lastHandSeenTime = 0;
 unsigned long lidClosedTime = 0;
 unsigned long lastHandCheckTime = 0;
@@ -42,6 +59,8 @@ unsigned long lastFillCheckTime = 0;
 unsigned long lastPingTime = 0;
 unsigned long lastStepTime = 0;
 unsigned long lastPrintTime = 0;
+unsigned long lastSendTime = 0;
+unsigned long lastWifiTryTime = 0;
 
 float readDistanceCm(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);
@@ -63,6 +82,14 @@ int distanceToPercent(float distanceCm) {
   return constrain((int)percent, 0, 100);
 }
 
+void updateBinFull() {
+  if (fillPercent < 0) return;
+  bool fullNow = (fillPercent >= fullLevelPercent);
+  if (fullNow == binIsFull) return;
+  binIsFull = fullNow;
+  Serial.println(binIsFull ? ">>> BIN FULL" : ">>> Bin no longer full");
+}
+
 void checkHand(unsigned long now) {
   handDistanceCm = readDistanceCm(HAND_TRIG_PIN, HAND_ECHO_PIN);
   bool handIsClose = (handDistanceCm > 0 && handDistanceCm < HAND_OPEN_DISTANCE_CM);
@@ -72,6 +99,7 @@ void checkHand(unsigned long now) {
     if (!lidShouldBeOpen) {
       lidShouldBeOpen = true;
       lidIsClosed = false;
+      lidOpensToSend++;
       Serial.println(">>> Hand detected, opening lid");
     }
   } else if (lidShouldBeOpen && now - lastHandSeenTime >= LID_STAY_OPEN_MS) {
@@ -84,6 +112,7 @@ void checkFill(unsigned long now) {
   fillDistanceCm = readDistanceCm(FILL_TRIG_PIN, FILL_ECHO_PIN);
   if (fillDistanceCm > 0) {
     fillPercent = distanceToPercent(fillDistanceCm);
+    updateBinFull();
   }
 }
 
@@ -108,6 +137,135 @@ void moveLid(unsigned long now) {
   }
 }
 
+void startWifi() {
+  Serial.print("Wi-Fi: connecting to ");
+  Serial.println(WIFI_NAME);
+  WiFi.begin(WIFI_NAME, WIFI_PASSWORD);
+  lastWifiTryTime = millis();
+}
+
+void maintainWifi(unsigned long now) {
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected && !wifiWasConnected) {
+    Serial.print("Wi-Fi: connected, board IP ");
+    Serial.println(WiFi.localIP());
+  }
+  if (!connected && wifiWasConnected) {
+    Serial.println("Wi-Fi: connection lost");
+  }
+  wifiWasConnected = connected;
+
+  if (!connected && lidIsClosed && now - lastWifiTryTime >= WIFI_RETRY_TIME_MS) {
+    startWifi();
+  }
+}
+
+String buildMessage(int lidOpens) {
+  String items = "{\"type\":\"reading\",\"seq\":";
+  items += messageNumber++;
+  if (handDistanceCm > 0) {
+    items += ",\"hand_cm\":";
+    items += String(handDistanceCm, 1);
+  }
+  if (fillDistanceCm > 0) {
+    items += ",\"fill_cm\":";
+    items += String(fillDistanceCm, 1);
+  }
+  if (fillPercent >= 0) {
+    items += ",\"fill_percent\":";
+    items += fillPercent;
+  }
+  items += ",\"lid_open\":";
+  items += lidIsClosed ? "false" : "true";
+  items += ",\"bin_full\":";
+  items += binIsFull ? "true" : "false";
+  items += ",\"wifi_rssi\":";
+  items += WiFi.RSSI();
+  items += ",\"uptime_s\":";
+  items += millis() / 1000;
+  items += "}";
+
+  for (int i = 0; i < lidOpens; i++) {
+    items += ",{\"type\":\"event\",\"seq\":";
+    items += messageNumber++;
+    items += ",\"name\":\"lid_open\",\"detail\":\"hand\"}";
+  }
+
+  String message = "{\"device_id\":\"";
+  message += DEVICE_ID;
+  message += "\",\"boot_id\":\"";
+  message += bootId;
+  message += "\",\"full_level_percent\":";
+  message += fullLevelPercent;
+  message += ",\"empty_distance_cm\":";
+  message += String(EMPTY_BIN_DISTANCE_CM, 1);
+  message += ",\"items\":[";
+  message += items;
+  message += "]}";
+  return message;
+}
+
+int findNumberAfter(const String& text, const String& key) {
+  int start = text.indexOf(key);
+  if (start < 0) return -1;
+  start += key.length();
+  while (start < (int)text.length() && text[start] == ' ') start++;
+  int end = start;
+  while (end < (int)text.length() && isDigit(text[end])) end++;
+  if (end == start) return -1;
+  return text.substring(start, end).toInt();
+}
+
+bool sendReport() {
+  int lidOpens = min(lidOpensToSend, MAX_LID_OPENS_PER_MESSAGE);
+  String message = buildMessage(lidOpens);
+
+  WiFiClient client;
+  client.setConnectionTimeout(SERVER_TIMEOUT_MS);
+  if (!client.connect(SERVER_ADDRESS, SERVER_PORT)) {
+    Serial.println("Server: could not connect (is app.py running? same hotspot? firewall?)");
+    return false;
+  }
+
+  client.print("POST /api/device/report HTTP/1.1\r\n");
+  client.print("Host: ");
+  client.print(SERVER_ADDRESS);
+  client.print("\r\n");
+  client.print("Content-Type: application/json\r\n");
+  client.print("Content-Length: ");
+  client.print(message.length());
+  client.print("\r\n");
+  client.print("Connection: close\r\n\r\n");
+  client.print(message);
+
+  String reply = "";
+  unsigned long start = millis();
+  while ((client.connected() || client.available()) && millis() - start < SERVER_TIMEOUT_MS) {
+    while (client.available()) {
+      char c = client.read();
+      if (reply.length() < 600) reply += c;
+    }
+  }
+  client.stop();
+
+  if (reply.indexOf(" 200 ") < 0) {
+    Serial.print("Server: unexpected reply: ");
+    Serial.println(reply.substring(0, reply.indexOf('\n')));
+    return false;
+  }
+
+  lidOpensToSend -= lidOpens;
+  int newLevel = findNumberAfter(reply, "\"full_level_percent\":");
+  if (newLevel >= 10 && newLevel <= 100 && newLevel != fullLevelPercent) {
+    fullLevelPercent = newLevel;
+    Serial.print(">>> New full level from website: ");
+    Serial.print(fullLevelPercent);
+    Serial.println("%");
+    updateBinFull();
+  }
+  return true;
+}
+
 void printStatus() {
   Serial.print("Hand: ");
   if (handDistanceCm < 0) Serial.print("--");
@@ -118,15 +276,21 @@ void printStatus() {
   Serial.print(" cm (");
   if (fillPercent < 0) Serial.print("--");
   else Serial.print(fillPercent);
+  Serial.print("% of ");
+  Serial.print(fullLevelPercent);
   Serial.print("%) | Lid: ");
-  Serial.println(lidIsClosed ? "closed" : "open");
+  Serial.print(lidIsClosed ? "closed" : "open");
+  Serial.print(" | WiFi: ");
+  Serial.print(WiFi.status() == WL_CONNECTED ? "ok" : "--");
+  Serial.print(" | Server: ");
+  Serial.println(lastSendWorked ? "ok" : "--");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("Smart Trash Can - sensors + servo test");
+  Serial.println("Smart Trash Can - sensors + servo + website");
 
   pinMode(HAND_TRIG_PIN, OUTPUT);
   pinMode(HAND_ECHO_PIN, INPUT);
@@ -135,8 +299,14 @@ void setup() {
   digitalWrite(HAND_TRIG_PIN, LOW);
   digitalWrite(FILL_TRIG_PIN, LOW);
 
-  lidServo.attach(SERVO_PIN);
+  lidServo.attach(SERVO_PIN, 500, 2400);
   lidServo.write(LID_CLOSED_ANGLE);
+
+  startWifi();
+  randomSeed(micros() + analogRead(A0));
+  bootId = "r4-";
+  bootId += String(random(0x7FFFFFFF), HEX);
+
   lidClosedTime = millis();
 }
 
@@ -155,6 +325,12 @@ void loop() {
   }
 
   moveLid(now);
+  maintainWifi(now);
+
+  if (now - lastSendTime >= SEND_TIME_MS && WiFi.status() == WL_CONNECTED) {
+    lastSendTime = now;
+    lastSendWorked = sendReport();
+  }
 
   if (now - lastPrintTime >= PRINT_TIME_MS) {
     lastPrintTime = now;

@@ -2,6 +2,7 @@ import hmac
 import math
 import os
 import secrets
+import socket
 import sqlite3
 import time
 from datetime import datetime
@@ -24,6 +25,8 @@ LOWEST_FULL_LEVEL = 10
 HIGHEST_FULL_LEVEL = 100
 OFFLINE_AFTER_SECONDS = 45
 MAX_CHART_POINTS = 400
+MAX_ITEMS_PER_REPORT = 100
+MAX_MESSAGE_AGE_SECONDS = 7 * 24 * 3600
 
 app = Flask(__name__)
 app.config.update(
@@ -142,6 +145,10 @@ def whole_number_or_none(value, lowest, highest):
     return None if number is None else int(number)
 
 
+def short_text(value, max_length):
+    return str(value)[:max_length] if value is not None else ""
+
+
 def dashboard_login_required(view):
     @wraps(view)
     def check(*args, **kwargs):
@@ -151,6 +158,79 @@ def dashboard_login_required(view):
             return redirect(url_for("login_page"))
         return view(*args, **kwargs)
     return check
+
+
+@app.post("/api/device/report")
+def device_report():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return jsonify(ok=False, error="expected JSON with an items list"), 400
+    items = data["items"][:MAX_ITEMS_PER_REPORT]
+
+    now = time.time()
+    device_id = short_text(data.get("device_id", "bin"), 32)
+    boot_id = short_text(data.get("boot_id", "unknown"), 40)
+    db = get_db()
+    new_rows = 0
+    highest_seq = -1
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        seq = whole_number_or_none(item.get("seq"), 0, 2**32)
+        if seq is None:
+            continue
+        age_seconds = (number_or_none(item.get("age_ms"), 0, MAX_MESSAGE_AGE_SECONDS * 1000) or 0) / 1000
+        created_at = now - age_seconds
+        highest_seq = max(highest_seq, seq)
+
+        if item.get("type") == "reading":
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO readings (device_id, boot_id, seq, created_at, received_at, "
+                "hand_cm, fill_cm, fill_percent, lid_open, bin_full, wifi_rssi, uptime_s) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device_id, boot_id, seq, created_at, now,
+                    number_or_none(item.get("hand_cm"), 0, 1000),
+                    number_or_none(item.get("fill_cm"), 0, 1000),
+                    number_or_none(item.get("fill_percent"), 0, 100),
+                    1 if item.get("lid_open") is True else 0,
+                    1 if item.get("bin_full") is True else 0,
+                    whole_number_or_none(item.get("wifi_rssi"), -150, 0),
+                    whole_number_or_none(item.get("uptime_s"), 0, 2**32),
+                ),
+            )
+        elif item.get("type") == "event":
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO events (device_id, boot_id, seq, created_at, received_at, name, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (device_id, boot_id, seq, created_at, now,
+                 short_text(item.get("name"), 32), short_text(item.get("detail"), 64)),
+            )
+        else:
+            continue
+        new_rows += cursor.rowcount
+
+    dropped = whole_number_or_none(data.get("dropped_messages"), 0, 2**32) or 0
+    db.execute(
+        "INSERT INTO boots (boot_id, device_id, first_seen, last_seen, highest_seq, received_count, dropped_on_device) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(boot_id) DO UPDATE SET last_seen = excluded.last_seen, "
+        "highest_seq = MAX(highest_seq, excluded.highest_seq), "
+        "received_count = received_count + excluded.received_count, "
+        "dropped_on_device = excluded.dropped_on_device",
+        (boot_id, device_id, now, now, highest_seq, new_rows, dropped),
+    )
+
+    level_on_bin = whole_number_or_none(data.get("full_level_percent"), 0, 100)
+    if level_on_bin is not None:
+        save_setting("level_on_bin", level_on_bin)
+    empty_distance = number_or_none(data.get("empty_distance_cm"), 0, 500)
+    if empty_distance is not None:
+        save_setting("empty_distance_cm", round(empty_distance, 1))
+
+    db.commit()
+    return jsonify(ok=True, saved=new_rows, full_level_percent=get_full_level())
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -199,108 +279,4 @@ def status():
         if reason:
             sql += " AND detail = ?"
             values.append(reason)
-        return db.execute(sql, values).fetchone()["n"]
-
-    boot_rows = db.execute("SELECT * FROM boots ORDER BY first_seen").fetchall()
-    missing = sum(max(0, row["highest_seq"] + 1 - row["received_count"]) for row in boot_rows)
-
-    level_on_bin = get_setting("level_on_bin")
-    return jsonify(
-        ok=True,
-        server_time=now,
-        online=bool(last_message and now - last_message < OFFLINE_AFTER_SECONDS),
-        last_message_at=last_message,
-        full_level_percent=get_full_level(),
-        level_on_bin=int(level_on_bin) if level_on_bin is not None else None,
-        empty_distance_cm=get_setting("empty_distance_cm"),
-        latest=dict(latest) if latest else None,
-        opens={
-            "today": count_opens(start_of_today()),
-            "today_by_hand": count_opens(start_of_today(), "hand"),
-            "today_by_button": count_opens(start_of_today(), "button"),
-            "last_24h": count_opens(now - 24 * 3600),
-            "all_time": count_opens(0),
-        },
-        reboots=max(0, len(boot_rows) - 1),
-        missing_messages=missing,
-        first_seen=boot_rows[0]["first_seen"] if boot_rows else None,
-    )
-
-
-@app.get("/api/history")
-@dashboard_login_required
-def history():
-    hours = request.args.get("hours", default=24, type=float)
-    hours = min(max(hours, 0.25), 24 * 7)
-    since = time.time() - hours * 3600
-    rows = get_db().execute(
-        "SELECT created_at, fill_percent, hand_cm, lid_open FROM readings "
-        "WHERE created_at >= ? ORDER BY created_at",
-        (since,),
-    ).fetchall()
-
-    step = max(1, math.ceil(len(rows) / MAX_CHART_POINTS))
-    points = [dict(row) for row in rows[::step]]
-
-    bucket_seconds = max(900, int(hours * 3600 / 24))
-    open_rows = get_db().execute(
-        "SELECT CAST((created_at - ?) / ? AS INTEGER) AS bucket, COUNT(*) AS n "
-        "FROM events WHERE name = 'lid_open' AND created_at >= ? GROUP BY bucket",
-        (since, bucket_seconds, since),
-    ).fetchall()
-    bucket_count = math.ceil(hours * 3600 / bucket_seconds)
-    opens = [0] * bucket_count
-    for row in open_rows:
-        if 0 <= row["bucket"] < bucket_count:
-            opens[row["bucket"]] = row["n"]
-
-    return jsonify(
-        ok=True, since=since, hours=hours, points=points,
-        opens={"bucket_seconds": bucket_seconds, "counts": opens},
-        full_level_percent=get_full_level(),
-    )
-
-
-@app.get("/api/events")
-@dashboard_login_required
-def recent_events():
-    limit = min(max(request.args.get("limit", default=25, type=int), 1), 200)
-    rows = get_db().execute(
-        "SELECT created_at, name, detail, boot_id FROM events ORDER BY created_at DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    return jsonify(ok=True, events=[dict(row) for row in rows])
-
-
-@app.post("/api/settings")
-@dashboard_login_required
-def change_settings():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify(ok=False, error="expected JSON"), 400
-    level = whole_number_or_none(data.get("full_level_percent"), LOWEST_FULL_LEVEL, HIGHEST_FULL_LEVEL)
-    if level is None:
-        return jsonify(ok=False, error=f"full level must be {LOWEST_FULL_LEVEL} to {HIGHEST_FULL_LEVEL}"), 400
-
-    db = get_db()
-    old_level = get_full_level()
-    save_setting("full_level_percent", level)
-    if level != old_level:
-        now = time.time()
-        db.execute(
-            "INSERT INTO events (device_id, boot_id, seq, created_at, received_at, name, detail) "
-            "VALUES ('dashboard', 'dashboard', NULL, ?, ?, 'full_level_set', ?)",
-            (now, now, f"{old_level}% to {level}%"),
-        )
-    db.commit()
-    return jsonify(ok=True, full_level_percent=level)
-
-
-if __name__ == "__main__":
-    if not DASHBOARD_PASSWORD:
-        raise SystemExit("Missing password. Copy .env.example to .env and type your own DASHBOARD_PASSWORD.")
-    if DASHBOARD_PASSWORD == EXAMPLE_PASSWORD:
-        raise SystemExit("Please change DASHBOARD_PASSWORD in .env. Do not keep the example password.")
-    create_tables()
-    print(f"Website: http://127.0.0.1:{PORT}/  (log in with the password from .env)")
-    app.run(host="127.0.0.1", port=PORT, threaded=True)
+        return

@@ -3,3 +3,12 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+include/secrets.h
+
+server/.venv/
+server/.env
+server/certs/
+server/*.db
+server/*.db-*
+__pycache__/
