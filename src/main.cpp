@@ -9,16 +9,16 @@ const int FILL_TRIG_PIN = 4;
 const int FILL_ECHO_PIN = 5;
 const int SERVO_PIN = 9;
 
-const int LID_CLOSED_ANGLE = 90;
-const int LID_OPEN_ANGLE = 0;
+const int LID_CLOSED_ANGLE = 0;
+const int LID_OPEN_ANGLE = 90;
 const int LID_STEP_DEGREES = 2;
 const unsigned long LID_STEP_TIME_MS = 15;
 const unsigned long LID_STAY_OPEN_MS = 3000;
 
-const float HAND_OPEN_DISTANCE_CM = 5.0;
+const float HAND_OPEN_DISTANCE_CM = 10.0;
 const unsigned long HAND_CHECK_TIME_MS = 100;
 
-const float EMPTY_BIN_DISTANCE_CM = 12.0;
+const float EMPTY_BIN_DISTANCE_CM = 15.5;
 const float FULL_BIN_DISTANCE_CM = 4.0;
 const unsigned long FILL_CHECK_TIME_MS = 2000;
 const unsigned long LID_SETTLE_TIME_MS = 1000;
@@ -29,6 +29,7 @@ const unsigned long PRINT_TIME_MS = 1000;
 
 const char DEVICE_ID[] = "bin-1";
 const unsigned long SEND_TIME_MS = 10000;
+const unsigned long SEND_RETRY_AFTER_FAIL_MS = 60000;
 const unsigned long WIFI_RETRY_TIME_MS = 30000;
 const unsigned long SERVER_TIMEOUT_MS = 2000;
 const int MAX_LID_OPENS_PER_MESSAGE = 5;
@@ -60,6 +61,7 @@ unsigned long lastPingTime = 0;
 unsigned long lastStepTime = 0;
 unsigned long lastPrintTime = 0;
 unsigned long lastSendTime = 0;
+unsigned long nextSendWaitMs = SEND_TIME_MS;
 unsigned long lastWifiTryTime = 0;
 
 float readDistanceCm(int trigPin, int echoPin) {
@@ -327,9 +329,14 @@ void loop() {
   moveLid(now);
   maintainWifi(now);
 
-  if (now - lastSendTime >= SEND_TIME_MS && WiFi.status() == WL_CONNECTED) {
-    lastSendTime = now;
+  // Sending can block for several seconds when the server is unreachable,
+  // so only send while the lid is fully closed and staying closed,
+  // and wait longer before retrying after a failure.
+  bool lidIsResting = lidIsClosed && !lidShouldBeOpen;
+  if (lidIsResting && now - lastSendTime >= nextSendWaitMs && WiFi.status() == WL_CONNECTED) {
     lastSendWorked = sendReport();
+    lastSendTime = millis();
+    nextSendWaitMs = lastSendWorked ? SEND_TIME_MS : SEND_RETRY_AFTER_FAIL_MS;
   }
 
   if (now - lastPrintTime >= PRINT_TIME_MS) {
