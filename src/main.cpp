@@ -28,7 +28,7 @@ const unsigned long ECHO_TIMEOUT_US = 25000;
 const unsigned long QUIET_TIME_MS = 30;
 const unsigned long PRINT_TIME_MS = 1000;
 
-const char DEVICE_ID[] = "bin-1";
+// DEVICE_ID is in secrets.h, so each kit can have its own without changing this file.
 const unsigned long SEND_TIME_MS = 10000;
 const unsigned long SEND_RETRY_AFTER_FAIL_MS = 60000;
 const unsigned long WIFI_RETRY_TIME_MS = 30000;

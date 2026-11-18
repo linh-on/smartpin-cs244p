@@ -15,7 +15,12 @@
       <span class="dot" id="online-dot"></span>
       <span id="online-text">Waiting for data</span>
     </div>
-    <form method="post" action="/logout">
+    <label class="device-picker" id="device-picker" hidden>
+      Bin
+      <select id="device-select"></select>
+    </label>
+    <form method="post" action="/logout" class="account">
+      <span class="sub">{{ username }}</span>
       <button class="link-button" type="submit">Log out</button>
     </form>
   </header>
@@ -34,7 +39,7 @@
 
     <section class="card">
       <h2>Full level (when to warn)</h2>
-      <div class="sub">When the trash reaches this level, the bin shows BIN FULL and beeps.</div>
+      <div class="sub">When the trash reaches this level, the bin reports BIN FULL.</div>
       <div class="level-row">
         <input type="range" id="level-slider" min="10" max="100" step="5" value="80" aria-label="Full level percent">
         <span class="level-value" id="level-value">80%</span>

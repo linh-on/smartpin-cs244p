@@ -9,12 +9,10 @@ from dotenv import load_dotenv
 from device_auth import DeviceKey, parse_device_keys
 
 SERVER_FOLDER = Path(__file__).resolve().parent
-EXAMPLE_PASSWORD = "change-me"
 
 
 @dataclass(frozen=True)
 class Settings:
-    dashboard_password: str
     session_secret: str
     session_cookie_secure: bool
     database_url: str
@@ -26,7 +24,6 @@ class Settings:
 def load_settings() -> Settings:
     load_dotenv(SERVER_FOLDER / ".env")
     return Settings(
-        dashboard_password=os.environ.get("DASHBOARD_PASSWORD", ""),
         # Without a fixed secret, everyone is logged out when the server restarts.
         session_secret=os.environ.get("SESSION_SECRET") or secrets.token_hex(32),
         # Set to true once the dashboard is served over HTTPS.

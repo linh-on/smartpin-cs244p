@@ -2,12 +2,15 @@ const STATUS_REFRESH_MS = 5000;
 const HISTORY_REFRESH_MS = 30000;
 
 let selectedHours = 24;
+let selectedDevice = null;
 let savedFullLevel = null;
 let sliderTouched = false;
 let lastHistory = null;
 let lastStatus = null;
 
 function byId(id) { return document.getElementById(id); }
+
+function deviceQuery() { return `device=${encodeURIComponent(selectedDevice)}`; }
 
 async function getJson(url, options) {
   const reply = await fetch(url, options);
@@ -213,8 +216,11 @@ function drawBarChart(container, counts, bucketSeconds, xStart) {
 }
 
 async function refreshStatus() {
+  if (!selectedDevice) return;
+  const device = selectedDevice;
   let status;
-  try { status = await getJson("/api/status"); } catch (error) { return; }
+  try { status = await getJson(`/api/status?${deviceQuery()}`); } catch (error) { return; }
+  if (device !== selectedDevice) return;  // the user switched bins while this was loading
   lastStatus = status;
 
   byId("online-dot").classList.toggle("online", status.online);
@@ -282,7 +288,7 @@ function setupLevelControl() {
       const data = await getJson("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ full_level_percent: Number(slider.value) }),
+        body: JSON.stringify({ device_id: selectedDevice, full_level_percent: Number(slider.value) }),
       });
       sliderTouched = false;
       savedFullLevel = data.full_level_percent;
@@ -332,10 +338,41 @@ function drawHistory(history) {
 }
 
 async function refreshHistory() {
+  if (!selectedDevice) return;
+  const device = selectedDevice;
   try {
-    lastHistory = await getJson(`/api/history?hours=${selectedHours}`);
+    const history = await getJson(`/api/history?${deviceQuery()}&hours=${selectedHours}`);
+    if (device !== selectedDevice) return;  // the user switched bins while this was loading
+    lastHistory = history;
     drawHistory(lastHistory);
   } catch (error) { }
+}
+
+async function loadDevices() {
+  let data;
+  try { data = await getJson("/api/devices"); } catch (error) { return; }
+  if (data.devices.length === 0) {
+    byId("online-text").textContent = "No bins are linked to your account yet";
+    return;
+  }
+  const select = byId("device-select");
+  for (const deviceId of data.devices) {
+    const option = document.createElement("option");
+    option.value = deviceId;
+    option.textContent = deviceId;
+    select.appendChild(option);
+  }
+  byId("device-picker").hidden = data.devices.length < 2;
+  selectedDevice = data.devices[0];
+  select.addEventListener("change", () => {
+    selectedDevice = select.value;
+    sliderTouched = false;
+    lastStatus = null;
+    lastHistory = null;
+    byId("save-note").textContent = "";
+    refreshStatus();
+    refreshHistory();
+  });
 }
 
 function setupRangePicker() {
@@ -350,8 +387,10 @@ function setupRangePicker() {
 
 setupLevelControl();
 setupRangePicker();
-refreshStatus();
-refreshHistory();
+loadDevices().then(() => {
+  refreshStatus();
+  refreshHistory();
+});
 setInterval(refreshStatus, STATUS_REFRESH_MS);
 setInterval(refreshHistory, HISTORY_REFRESH_MS);
 let resizeTimer;

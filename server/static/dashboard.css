@@ -49,6 +49,10 @@ header h1 { font-size: 22px; margin: 0; flex: 1 1 auto; }
 .connection { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 14px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); }
 .dot.online { background: var(--good); }
+.device-picker { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 14px; }
+.device-picker[hidden] { display: none; }
+.device-picker select { font: inherit; padding: 5px 8px; border: 1px solid var(--axis); border-radius: 0; background: var(--surface); color: var(--text-primary); }
+.account { display: flex; align-items: center; gap: 6px; margin: 0; }
 .link-button { background: none; border: 0; color: var(--text-secondary); text-decoration: underline; cursor: pointer; font: inherit; padding: 4px; }
 
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-bottom: 16px; }
@@ -113,7 +117,8 @@ th { color: var(--text-secondary); font-weight: 600; }
 td.num { font-variant-numeric: tabular-nums; }
 
 .login-box { max-width: 360px; margin: 12vh auto 0; }
-.login-box input[type="password"] {
+.login-box label { display: block; }
+.login-box input[type="text"], .login-box input[type="password"] {
   width: 100%; padding: 10px 12px; border-radius: 0; border: 1px solid var(--axis);
   background: var(--page); color: var(--text-primary); font: inherit; margin: 8px 0 14px;
 }

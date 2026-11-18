@@ -3,7 +3,6 @@
 Run with:  python app.py
 """
 import asyncio
-import hmac
 import json
 import logging
 import math
@@ -22,10 +21,11 @@ from sqlmodel import Session, select
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
-from config import EXAMPLE_PASSWORD, SERVER_FOLDER, Settings, load_settings
-from db import (Boot, Event, Message, Reading, existing_seqs, get_setting,
-                make_engine, save_setting)
+from config import SERVER_FOLDER, Settings, load_settings
+from db import (Boot, Event, Message, Reading, Setting, User, devices_of, existing_seqs,
+                get_setting, make_engine, save_setting)
 from device_auth import signature_is_valid
+from passwords import UNKNOWN_USER_HASH, password_matches
 
 log = logging.getLogger("smartbin")
 
@@ -76,6 +76,7 @@ class Report(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
+    device_id: str = Field(min_length=1, max_length=32)
     full_level_percent: int = Field(ge=LOWEST_FULL_LEVEL, le=HIGHEST_FULL_LEVEL)
 
 
@@ -85,11 +86,44 @@ def error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"ok": False, "error": message}, status_code=status)
 
 
-def full_level(session: Session) -> int:
+def setting_name(name: str, device_id: str) -> str:
+    """Each bin has its own settings, stored as e.g. "full_level_percent:bin-1"."""
+    return f"{name}:{device_id}"
+
+
+def full_level(session: Session, device_id: str) -> int:
+    value = get_setting(session, setting_name("full_level_percent", device_id), DEFAULT_FULL_LEVEL)
     try:
-        return int(get_setting(session, "full_level_percent", DEFAULT_FULL_LEVEL))
+        return int(value)
     except ValueError:
         return DEFAULT_FULL_LEVEL
+
+
+def move_old_shared_settings(engine) -> None:
+    """Servers from before accounts kept one shared copy of each setting.
+    Give that value to every bin the server has already heard from, then delete it,
+    so new bins start from the defaults instead of someone else's settings."""
+    with Session(engine) as session:
+        known_devices = set(session.exec(select(Boot.device_id)).all())
+        for name in ("full_level_percent", "level_on_bin", "empty_distance_cm"):
+            old = session.get(Setting, name)
+            if old is None:
+                continue
+            for device_id in known_devices:
+                if get_setting(session, setting_name(name, device_id)) is None:
+                    save_setting(session, setting_name(name, device_id), old.value)
+            session.delete(old)
+        session.commit()
+
+
+def find_user(engine, username: str) -> User | None:
+    with Session(engine) as session:
+        return session.get(User, username) if username else None
+
+
+def count_users(engine) -> int:
+    with Session(engine) as session:
+        return session.exec(select(func.count()).select_from(User)).one()
 
 
 def start_of_today() -> float:
@@ -133,15 +167,16 @@ def save_report(engine, report: Report, body: bytes, signature: str, method: str
         session.add(boot)
 
         if report.full_level_percent is not None:
-            save_setting(session, "level_on_bin", report.full_level_percent)
+            save_setting(session, setting_name("level_on_bin", report.device_id), report.full_level_percent)
         if report.empty_distance_cm is not None:
-            save_setting(session, "empty_distance_cm", round(report.empty_distance_cm, 1))
+            save_setting(session, setting_name("empty_distance_cm", report.device_id),
+                         round(report.empty_distance_cm, 1))
 
         session.add(Message(device_id=report.device_id, boot_id=report.boot_id, received_at=now,
                             auth_method=method, signature=signature,
                             body=body.decode("utf-8", errors="replace")))
         session.commit()
-        return new_rows, full_level(session)
+        return new_rows, full_level(session, report.device_id)
 
 
 # ---------- the app ----------
@@ -149,10 +184,11 @@ def save_report(engine, report: Report, body: bytes, signature: str, method: str
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     engine = make_engine(settings.database_url)
+    move_old_shared_settings(engine)
     if not settings.device_keys:
         log.warning("DEVICE_KEYS is empty: every device report will be rejected")
-    if settings.dashboard_password in ("", EXAMPLE_PASSWORD):
-        log.warning("DASHBOARD_PASSWORD is not set: nobody can log in to the dashboard")
+    if count_users(engine) == 0:
+        log.warning("No dashboard accounts yet: add one with  python manage_users.py add <username> <device_id>")
 
     app = FastAPI(title="SmartBin", docs_url="/docs", redoc_url=None)
     app.state.settings = settings
@@ -176,11 +212,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with Session(engine) as session:
             yield session
 
-    def require_login(request: Request):
-        if not request.session.get("logged_in"):
-            raise HTTPException(401, "please log in")
-
     DB = Annotated[Session, Depends(db_session)]
+
+    def logged_in_user(request: Request, session: DB) -> str:
+        """The username of whoever is logged in. Checked against the database on every
+        request, so removing an account logs that person out right away."""
+        username = request.session.get("username")
+        if not username or session.get(User, username) is None:
+            raise HTTPException(401, "please log in")
+        return username
+
+    LoggedInUser = Annotated[str, Depends(logged_in_user)]
+
+    def check_device(session: Session, username: str, device_id: str) -> None:
+        # Same answer for "bin does not exist" and "not your bin", so nobody can
+        # discover other teams' bin names by guessing.
+        if device_id not in devices_of(session, username):
+            raise HTTPException(404, "no such bin on your account")
 
     # ----- device -----
 
@@ -222,19 +270,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/login", name="login_page")
     def login_page(request: Request):
-        return templates.TemplateResponse(request, "login.html", {"error": None})
+        return templates.TemplateResponse(request, "login.html", {"error": None, "username": ""})
 
     @app.post("/login")
-    async def login(request: Request, password: Annotated[str, Form()] = ""):
-        expected = settings.dashboard_password
-        if expected not in ("", EXAMPLE_PASSWORD) and hmac.compare_digest(password.encode(), expected.encode()):
+    async def login(request: Request, username: Annotated[str, Form()] = "",
+                    password: Annotated[str, Form()] = ""):
+        username = username.strip().lower()
+        user = await run_in_threadpool(find_user, engine, username)
+        # Always check a hash, even for an unknown username, so both take the same time.
+        stored_hash = user.password_hash if user else UNKNOWN_USER_HASH
+        correct = await run_in_threadpool(password_matches, password, stored_hash)
+        if user is not None and correct:
             request.session.clear()
-            request.session["logged_in"] = True
+            request.session["username"] = user.username
             return RedirectResponse("/", status_code=303)
         await asyncio.sleep(1)
-        message = ("Set DASHBOARD_PASSWORD in server/.env first"
-                   if expected in ("", EXAMPLE_PASSWORD) else "Wrong password")
-        return templates.TemplateResponse(request, "login.html", {"error": message}, status_code=401)
+        no_accounts = await run_in_threadpool(count_users, engine) == 0
+        message = ("No accounts yet: run  python manage_users.py add <username> <device_id>"
+                   if no_accounts else "Wrong username or password")
+        return templates.TemplateResponse(request, "login.html",
+                                          {"error": message, "username": username}, status_code=401)
 
     @app.post("/logout", name="logout")
     def logout(request: Request):
@@ -242,36 +297,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return RedirectResponse("/login", status_code=303)
 
     @app.get("/")
-    def dashboard_page(request: Request):
-        if not request.session.get("logged_in"):
+    def dashboard_page(request: Request, session: DB):
+        username = request.session.get("username")
+        if not username or session.get(User, username) is None:
             return RedirectResponse("/login", status_code=303)
-        return templates.TemplateResponse(request, "dashboard.html", {})
+        return templates.TemplateResponse(request, "dashboard.html", {"username": username})
 
     # ----- dashboard API -----
+    # Every route below needs a logged-in user and only shows bins linked to that user.
 
-    @app.get("/api/status", dependencies=[Depends(require_login)])
-    def status(session: DB):
+    @app.get("/api/devices")
+    def my_devices(username: LoggedInUser, session: DB):
+        return {"ok": True, "username": username, "devices": devices_of(session, username)}
+
+    @app.get("/api/status")
+    def status(username: LoggedInUser, session: DB, device: str):
+        check_device(session, username, device)
         now = time.time()
-        latest = session.exec(select(Reading).order_by(Reading.created_at.desc()).limit(1)).first()
-        last_message = session.exec(select(func.max(Boot.last_seen))).one()
+        latest = session.exec(select(Reading).where(Reading.device_id == device)
+                              .order_by(Reading.created_at.desc()).limit(1)).first()
+        last_message = session.exec(select(func.max(Boot.last_seen)).where(Boot.device_id == device)).one()
 
         def count_opens(since: float, reason: str | None = None) -> int:
             query = select(func.count()).select_from(Event).where(
-                Event.name == "lid_open", Event.created_at >= since)
+                Event.device_id == device, Event.name == "lid_open", Event.created_at >= since)
             if reason:
                 query = query.where(Event.detail == reason)
             return session.exec(query).one()
 
-        boots = session.exec(select(Boot).order_by(Boot.first_seen)).all()
-        level_on_bin = get_setting(session, "level_on_bin")
-        empty_distance = get_setting(session, "empty_distance_cm")
+        boots = session.exec(select(Boot).where(Boot.device_id == device).order_by(Boot.first_seen)).all()
+        level_on_bin = get_setting(session, setting_name("level_on_bin", device))
+        empty_distance = get_setting(session, setting_name("empty_distance_cm", device))
         today = start_of_today()
         return {
             "ok": True,
+            "device_id": device,
             "server_time": now,
             "online": bool(last_message and now - last_message < OFFLINE_AFTER_SECONDS),
             "last_message_at": last_message,
-            "full_level_percent": full_level(session),
+            "full_level_percent": full_level(session, device),
             "level_on_bin": int(level_on_bin) if level_on_bin is not None else None,
             "empty_distance_cm": float(empty_distance) if empty_distance is not None else None,
             "latest": latest.model_dump() if latest else None,
@@ -287,13 +351,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "first_seen": boots[0].first_seen if boots else None,
         }
 
-    @app.get("/api/history", dependencies=[Depends(require_login)])
-    def history(session: DB, hours: float = 24):
+    @app.get("/api/history")
+    def history(username: LoggedInUser, session: DB, device: str, hours: float = 24):
+        check_device(session, username, device)
         hours = min(max(hours, 0.25), 24 * 7)
         since = time.time() - hours * 3600
         rows = session.exec(
             select(Reading.created_at, Reading.fill_percent, Reading.hand_cm, Reading.lid_open)
-            .where(Reading.created_at >= since).order_by(Reading.created_at)
+            .where(Reading.device_id == device, Reading.created_at >= since).order_by(Reading.created_at)
         ).all()
         step = max(1, math.ceil(len(rows) / MAX_CHART_POINTS))
         points = [{"created_at": r[0], "fill_percent": r[1], "hand_cm": r[2], "lid_open": r[3]}
@@ -303,35 +368,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         bucket_count = math.ceil(hours * 3600 / bucket_seconds)
         counts = [0] * bucket_count
         open_times = session.exec(
-            select(Event.created_at).where(Event.name == "lid_open", Event.created_at >= since)
+            select(Event.created_at).where(Event.device_id == device, Event.name == "lid_open",
+                                           Event.created_at >= since)
         ).all()
         for t in open_times:
             index = int((t - since) // bucket_seconds)
             if 0 <= index < bucket_count:
                 counts[index] += 1
 
-        return {"ok": True, "since": since, "hours": hours, "points": points,
+        return {"ok": True, "device_id": device, "since": since, "hours": hours, "points": points,
                 "opens": {"bucket_seconds": bucket_seconds, "counts": counts},
-                "full_level_percent": full_level(session)}
+                "full_level_percent": full_level(session, device)}
 
-    @app.get("/api/events", dependencies=[Depends(require_login)])
-    def recent_events(session: DB, limit: Annotated[int, Query(ge=1, le=200)] = 25):
-        rows = session.exec(select(Event).order_by(Event.created_at.desc()).limit(limit)).all()
+    @app.get("/api/events")
+    def recent_events(username: LoggedInUser, session: DB, device: str,
+                      limit: Annotated[int, Query(ge=1, le=200)] = 25):
+        check_device(session, username, device)
+        rows = session.exec(select(Event).where(Event.device_id == device)
+                            .order_by(Event.created_at.desc()).limit(limit)).all()
         return {"ok": True, "events": [
             {"created_at": e.created_at, "name": e.name, "detail": e.detail, "boot_id": e.boot_id}
             for e in rows]}
 
-    @app.post("/api/settings", dependencies=[Depends(require_login)])
-    def change_settings(update: SettingsUpdate, session: DB):
-        old_level = full_level(session)
-        save_setting(session, "full_level_percent", update.full_level_percent)
+    @app.post("/api/settings")
+    def change_settings(update: SettingsUpdate, username: LoggedInUser, session: DB):
+        device = update.device_id
+        check_device(session, username, device)
+        old_level = full_level(session, device)
+        save_setting(session, setting_name("full_level_percent", device), update.full_level_percent)
         if update.full_level_percent != old_level:
             now = time.time()
-            session.add(Event(device_id="dashboard", boot_id="dashboard", seq=None, created_at=now,
+            session.add(Event(device_id=device, boot_id="dashboard", seq=None, created_at=now,
                               received_at=now, name="full_level_set",
-                              detail=f"{old_level}% to {update.full_level_percent}%"))
+                              detail=f"{username}: {old_level}% to {update.full_level_percent}%"))
         session.commit()
-        return {"ok": True, "full_level_percent": update.full_level_percent}
+        return {"ok": True, "device_id": device, "full_level_percent": update.full_level_percent}
 
     return app
 

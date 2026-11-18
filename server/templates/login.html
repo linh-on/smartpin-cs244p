@@ -10,8 +10,12 @@
   <div class="page">
     <form class="card login-box" method="post">
       <h1 style="margin-top:0;font-size:22px">Smart Trash Can</h1>
-      <label for="password">Dashboard password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username"
+             autocapitalize="none" spellcheck="false" {% if not username %}autofocus{% endif %} required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password"
+             {% if username %}autofocus{% endif %} required>
       {% if error %}<p class="error">{{ error }}</p>{% endif %}
       <button class="primary" type="submit">Log in</button>
     </form>

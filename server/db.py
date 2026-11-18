@@ -60,6 +60,23 @@ class Setting(SQLModel, table=True):
     updated_at: float
 
 
+class User(SQLModel, table=True):
+    """A person who can log in to the dashboard. Bins never log in: they sign their reports."""
+    __tablename__ = "users"
+
+    username: str = Field(primary_key=True)
+    password_hash: str
+    created_at: float
+
+
+class UserDevice(SQLModel, table=True):
+    """Which bins each user may see. One bin can be linked to several users (teammates)."""
+    __tablename__ = "user_devices"
+
+    username: str = Field(primary_key=True)
+    device_id: str = Field(primary_key=True)
+
+
 class Message(SQLModel, table=True):
     """Append-only log of every accepted device report and its signature.
 
@@ -102,6 +119,11 @@ def save_setting(session: Session, name: str, value) -> None:
     else:
         row.value, row.updated_at = str(value), time.time()
     session.add(row)
+
+
+def devices_of(session: Session, username: str) -> list[str]:
+    query = select(UserDevice.device_id).where(UserDevice.username == username).order_by(UserDevice.device_id)
+    return list(session.exec(query).all())
 
 
 def existing_seqs(session: Session, table, boot_id: str, seqs: list[int]) -> set[int]:
