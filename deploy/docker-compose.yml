@@ -1,0 +1,33 @@
+# Runs the server behind Caddy, which gets an HTTPS certificate for DOMAIN automatically.
+# Usage (on the cloud VM, from this folder):
+#   echo "DOMAIN=your-name.duckdns.org" > .env
+#   sudo docker compose up -d --build
+services:
+  app:
+    build: ../server
+    env_file: ../server/.env
+    environment:
+      SESSION_COOKIE_SECURE: "true"
+    volumes:
+      - app-data:/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in deploy/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  app-data:
+  caddy-data:
+  caddy-config:

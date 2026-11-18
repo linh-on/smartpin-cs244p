@@ -12,3 +12,4 @@ server/certs/
 server/*.db
 server/*.db-*
 __pycache__/
+deploy/.env
