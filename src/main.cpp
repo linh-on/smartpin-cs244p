@@ -32,7 +32,7 @@ const char DEVICE_ID[] = "bin-1";
 const unsigned long SEND_TIME_MS = 10000;
 const unsigned long SEND_RETRY_AFTER_FAIL_MS = 60000;
 const unsigned long WIFI_RETRY_TIME_MS = 30000;
-const unsigned long SERVER_TIMEOUT_MS = 2000;
+const unsigned long SERVER_TIMEOUT_MS = 5000;
 const int MAX_LID_OPENS_PER_MESSAGE = 5;
 const int DEFAULT_FULL_LEVEL_PERCENT = 80;
 
@@ -245,10 +245,20 @@ bool sendReport() {
   String message = buildMessage(lidOpens);
   String signature = signMessage(message);
 
-  WiFiClient client;
+  // Port 443 means the cloud server: use HTTPS, which also checks the
+  // server's certificate. Any other port is the laptop server over plain HTTP.
+  WiFiClient plainClient;
+  WiFiSSLClient secureClient;
+  const bool useHttps = (SERVER_PORT == 443);
+  WiFiClient& client = useHttps ? secureClient : plainClient;
+
   client.setConnectionTimeout(SERVER_TIMEOUT_MS);
   if (!client.connect(SERVER_ADDRESS, SERVER_PORT)) {
-    Serial.println("Server: could not connect (is app.py running? same hotspot? firewall?)");
+    if (useHttps) {
+      Serial.println("Server: HTTPS connection failed (wrong address, no internet, or certificate not trusted)");
+    } else {
+      Serial.println("Server: could not connect (is app.py running? same network? firewall?)");
+    }
     return false;
   }
 
