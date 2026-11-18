@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Smart Trash Can</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
 <div class="page">
@@ -15,7 +15,7 @@
       <span class="dot" id="online-dot"></span>
       <span id="online-text">Waiting for data</span>
     </div>
-    <form method="post" action="{{ url_for('logout') }}">
+    <form method="post" action="/logout">
       <button class="link-button" type="submit">Log out</button>
     </form>
   </header>
@@ -77,6 +77,6 @@
   </section>
 
 </div>
-<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+<script src="/static/dashboard.js"></script>
 </body>
 </html>

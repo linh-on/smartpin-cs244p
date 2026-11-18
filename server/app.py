@@ -1,24 +1,33 @@
+"""SmartBin server: receives signed reports from the bin and serves the dashboard.
+
+Run with:  python app.py
+"""
+import asyncio
 import hmac
+import json
+import logging
 import math
-import os
-import secrets
-import socket
-import sqlite3
 import time
 from datetime import datetime
-from functools import wraps
+from typing import Annotated, Literal
 
-from dotenv import load_dotenv
-from flask import (Flask, g, jsonify, redirect, render_template, request,
-                   session, url_for)
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import func
+from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
+from starlette.middleware.sessions import SessionMiddleware
 
-SERVER_FOLDER = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(SERVER_FOLDER, ".env"))
+from config import EXAMPLE_PASSWORD, SERVER_FOLDER, Settings, load_settings
+from db import (Boot, Event, Message, Reading, existing_seqs, get_setting,
+                make_engine, save_setting)
+from device_auth import signature_is_valid
 
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
-DATABASE_FILE = os.path.join(SERVER_FOLDER, os.environ.get("DATABASE_FILE", "trash_can.db"))
-PORT = int(os.environ.get("PORT", "5000"))
-EXAMPLE_PASSWORD = "change-me"
+log = logging.getLogger("smartbin")
 
 DEFAULT_FULL_LEVEL = 80
 LOWEST_FULL_LEVEL = 10
@@ -26,257 +35,313 @@ HIGHEST_FULL_LEVEL = 100
 OFFLINE_AFTER_SECONDS = 45
 MAX_CHART_POINTS = 400
 MAX_ITEMS_PER_REPORT = 100
-MAX_MESSAGE_AGE_SECONDS = 7 * 24 * 3600
-
-app = Flask(__name__)
-app.config.update(
-    SECRET_KEY=os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32),
-    SESSION_COOKIE_SECURE=False,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Strict",
-    MAX_CONTENT_LENGTH=64 * 1024,
-)
+MAX_BODY_BYTES = 64 * 1024
+MAX_MESSAGE_AGE_MS = 7 * 24 * 3600 * 1000
 
 
-DATABASE_TABLES = """
-CREATE TABLE IF NOT EXISTS readings (
-    id INTEGER PRIMARY KEY,
-    device_id TEXT NOT NULL,
-    boot_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    created_at REAL NOT NULL,
-    received_at REAL NOT NULL,
-    hand_cm REAL,
-    fill_cm REAL,
-    fill_percent REAL,
-    lid_open INTEGER,
-    bin_full INTEGER,
-    wifi_rssi INTEGER,
-    uptime_s INTEGER,
-    UNIQUE (boot_id, seq)
-);
-CREATE INDEX IF NOT EXISTS readings_by_time ON readings (created_at);
+# ---------- what the device sends ----------
 
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY,
-    device_id TEXT NOT NULL,
-    boot_id TEXT NOT NULL,
-    seq INTEGER,
-    created_at REAL NOT NULL,
-    received_at REAL NOT NULL,
-    name TEXT NOT NULL,
-    detail TEXT,
-    UNIQUE (boot_id, seq)
-);
-CREATE INDEX IF NOT EXISTS events_by_time ON events (created_at);
-CREATE INDEX IF NOT EXISTS events_by_name ON events (name, created_at);
-
-CREATE TABLE IF NOT EXISTS boots (
-    boot_id TEXT PRIMARY KEY,
-    device_id TEXT NOT NULL,
-    first_seen REAL NOT NULL,
-    last_seen REAL NOT NULL,
-    highest_seq INTEGER NOT NULL,
-    received_count INTEGER NOT NULL,
-    dropped_on_device INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS settings (
-    name TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at REAL NOT NULL
-);
-"""
+class ReadingItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    type: Literal["reading"]
+    seq: int = Field(ge=0, le=2**32)
+    age_ms: float = Field(default=0, ge=0, le=MAX_MESSAGE_AGE_MS)
+    hand_cm: float | None = Field(default=None, ge=0, le=1000)
+    fill_cm: float | None = Field(default=None, ge=0, le=1000)
+    fill_percent: float | None = Field(default=None, ge=0, le=100)
+    lid_open: bool = False
+    bin_full: bool = False
+    wifi_rssi: int | None = Field(default=None, ge=-150, le=0)
+    uptime_s: int | None = Field(default=None, ge=0, le=2**32)
 
 
-def get_db():
-    if "db" not in g:
-        g.db = sqlite3.connect(DATABASE_FILE, timeout=10)
-        g.db.row_factory = sqlite3.Row
-    return g.db
+class EventItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    type: Literal["event"]
+    seq: int = Field(ge=0, le=2**32)
+    age_ms: float = Field(default=0, ge=0, le=MAX_MESSAGE_AGE_MS)
+    name: str = Field(min_length=1, max_length=32)
+    detail: str = Field(default="", max_length=64)
 
 
-@app.teardown_appcontext
-def close_db(error):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
+class Report(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    device_id: str = Field(min_length=1, max_length=32)
+    boot_id: str = Field(min_length=1, max_length=40)
+    items: list[Annotated[ReadingItem | EventItem, Field(discriminator="type")]] = Field(
+        max_length=MAX_ITEMS_PER_REPORT)
+    full_level_percent: int | None = Field(default=None, ge=0, le=100)
+    empty_distance_cm: float | None = Field(default=None, ge=0, le=500)
+    dropped_messages: int = Field(default=0, ge=0)
 
 
-def create_tables():
-    db = sqlite3.connect(DATABASE_FILE)
-    db.execute("PRAGMA journal_mode=WAL")
-    db.executescript(DATABASE_TABLES)
-    db.commit()
-    db.close()
+class SettingsUpdate(BaseModel):
+    full_level_percent: int = Field(ge=LOWEST_FULL_LEVEL, le=HIGHEST_FULL_LEVEL)
 
 
-def get_setting(name, default=None):
-    row = get_db().execute("SELECT value FROM settings WHERE name = ?", (name,)).fetchone()
-    return row["value"] if row else default
+# ---------- helpers ----------
+
+def error(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message}, status_code=status)
 
 
-def save_setting(name, value):
-    get_db().execute(
-        "INSERT INTO settings (name, value, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        (name, str(value), time.time()),
-    )
-
-
-def get_full_level():
+def full_level(session: Session) -> int:
     try:
-        return int(get_setting("full_level_percent", DEFAULT_FULL_LEVEL))
+        return int(get_setting(session, "full_level_percent", DEFAULT_FULL_LEVEL))
     except ValueError:
         return DEFAULT_FULL_LEVEL
 
 
-def number_or_none(value, lowest, highest):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    value = float(value)
-    if math.isnan(value) or value < lowest or value > highest:
-        return None
-    return value
+def start_of_today() -> float:
+    return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
-def whole_number_or_none(value, lowest, highest):
-    number = number_or_none(value, lowest, highest)
-    return None if number is None else int(number)
-
-
-def short_text(value, max_length):
-    return str(value)[:max_length] if value is not None else ""
-
-
-def dashboard_login_required(view):
-    @wraps(view)
-    def check(*args, **kwargs):
-        if not session.get("logged_in"):
-            if request.path.startswith("/api/"):
-                return jsonify(ok=False, error="please log in"), 401
-            return redirect(url_for("login_page"))
-        return view(*args, **kwargs)
-    return check
-
-
-@app.post("/api/device/report")
-def device_report():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-        return jsonify(ok=False, error="expected JSON with an items list"), 400
-    items = data["items"][:MAX_ITEMS_PER_REPORT]
-
+def save_report(engine, report: Report, body: bytes, signature: str, method: str) -> tuple[int, int]:
+    """Stores a verified report. Returns (new rows saved, full level for the bin)."""
     now = time.time()
-    device_id = short_text(data.get("device_id", "bin"), 32)
-    boot_id = short_text(data.get("boot_id", "unknown"), 40)
-    db = get_db()
-    new_rows = 0
-    highest_seq = -1
+    with Session(engine) as session:
+        readings_seen = existing_seqs(session, Reading, report.boot_id,
+                                      [i.seq for i in report.items if i.type == "reading"])
+        events_seen = existing_seqs(session, Event, report.boot_id,
+                                    [i.seq for i in report.items if i.type == "event"])
+        new_rows = 0
+        for item in report.items:
+            created_at = now - item.age_ms / 1000
+            common = dict(device_id=report.device_id, boot_id=report.boot_id, seq=item.seq,
+                          created_at=created_at, received_at=now)
+            if item.type == "reading" and item.seq not in readings_seen:
+                readings_seen.add(item.seq)
+                session.add(Reading(**common, hand_cm=item.hand_cm, fill_cm=item.fill_cm,
+                                    fill_percent=item.fill_percent, lid_open=item.lid_open,
+                                    bin_full=item.bin_full, wifi_rssi=item.wifi_rssi,
+                                    uptime_s=item.uptime_s))
+                new_rows += 1
+            elif item.type == "event" and item.seq not in events_seen:
+                events_seen.add(item.seq)
+                session.add(Event(**common, name=item.name, detail=item.detail))
+                new_rows += 1
 
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        seq = whole_number_or_none(item.get("seq"), 0, 2**32)
-        if seq is None:
-            continue
-        age_seconds = (number_or_none(item.get("age_ms"), 0, MAX_MESSAGE_AGE_SECONDS * 1000) or 0) / 1000
-        created_at = now - age_seconds
-        highest_seq = max(highest_seq, seq)
+        highest_seq = max((i.seq for i in report.items), default=-1)
+        boot = session.get(Boot, report.boot_id)
+        if boot is None:
+            boot = Boot(boot_id=report.boot_id, device_id=report.device_id, first_seen=now,
+                        last_seen=now, highest_seq=highest_seq, received_count=0)
+        boot.last_seen = now
+        boot.highest_seq = max(boot.highest_seq, highest_seq)
+        boot.received_count += new_rows
+        boot.dropped_on_device = report.dropped_messages
+        session.add(boot)
 
-        if item.get("type") == "reading":
-            cursor = db.execute(
-                "INSERT OR IGNORE INTO readings (device_id, boot_id, seq, created_at, received_at, "
-                "hand_cm, fill_cm, fill_percent, lid_open, bin_full, wifi_rssi, uptime_s) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    device_id, boot_id, seq, created_at, now,
-                    number_or_none(item.get("hand_cm"), 0, 1000),
-                    number_or_none(item.get("fill_cm"), 0, 1000),
-                    number_or_none(item.get("fill_percent"), 0, 100),
-                    1 if item.get("lid_open") is True else 0,
-                    1 if item.get("bin_full") is True else 0,
-                    whole_number_or_none(item.get("wifi_rssi"), -150, 0),
-                    whole_number_or_none(item.get("uptime_s"), 0, 2**32),
-                ),
-            )
-        elif item.get("type") == "event":
-            cursor = db.execute(
-                "INSERT OR IGNORE INTO events (device_id, boot_id, seq, created_at, received_at, name, detail) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (device_id, boot_id, seq, created_at, now,
-                 short_text(item.get("name"), 32), short_text(item.get("detail"), 64)),
-            )
-        else:
-            continue
-        new_rows += cursor.rowcount
+        if report.full_level_percent is not None:
+            save_setting(session, "level_on_bin", report.full_level_percent)
+        if report.empty_distance_cm is not None:
+            save_setting(session, "empty_distance_cm", round(report.empty_distance_cm, 1))
 
-    dropped = whole_number_or_none(data.get("dropped_messages"), 0, 2**32) or 0
-    db.execute(
-        "INSERT INTO boots (boot_id, device_id, first_seen, last_seen, highest_seq, received_count, dropped_on_device) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(boot_id) DO UPDATE SET last_seen = excluded.last_seen, "
-        "highest_seq = MAX(highest_seq, excluded.highest_seq), "
-        "received_count = received_count + excluded.received_count, "
-        "dropped_on_device = excluded.dropped_on_device",
-        (boot_id, device_id, now, now, highest_seq, new_rows, dropped),
-    )
-
-    level_on_bin = whole_number_or_none(data.get("full_level_percent"), 0, 100)
-    if level_on_bin is not None:
-        save_setting("level_on_bin", level_on_bin)
-    empty_distance = number_or_none(data.get("empty_distance_cm"), 0, 500)
-    if empty_distance is not None:
-        save_setting("empty_distance_cm", round(empty_distance, 1))
-
-    db.commit()
-    return jsonify(ok=True, saved=new_rows, full_level_percent=get_full_level())
+        session.add(Message(device_id=report.device_id, boot_id=report.boot_id, received_at=now,
+                            auth_method=method, signature=signature,
+                            body=body.decode("utf-8", errors="replace")))
+        session.commit()
+        return new_rows, full_level(session)
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login_page():
-    error = None
-    if request.method == "POST":
-        typed = request.form.get("password", "")
-        if DASHBOARD_PASSWORD and hmac.compare_digest(typed, DASHBOARD_PASSWORD):
-            session.clear()
-            session["logged_in"] = True
-            session.permanent = True
-            return redirect(url_for("dashboard_page"))
-        time.sleep(1)
-        error = "Wrong password"
-    return render_template("login.html", error=error)
+# ---------- the app ----------
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or load_settings()
+    engine = make_engine(settings.database_url)
+    if not settings.device_keys:
+        log.warning("DEVICE_KEYS is empty: every device report will be rejected")
+    if settings.dashboard_password in ("", EXAMPLE_PASSWORD):
+        log.warning("DASHBOARD_PASSWORD is not set: nobody can log in to the dashboard")
+
+    app = FastAPI(title="SmartBin", docs_url="/docs", redoc_url=None)
+    app.state.settings = settings
+    app.state.engine = engine
+    app.add_middleware(SessionMiddleware, secret_key=settings.session_secret,
+                       same_site="strict", https_only=settings.session_cookie_secure)
+    app.mount("/static", StaticFiles(directory=SERVER_FOLDER / "static"), name="static")
+    templates = Jinja2Templates(directory=SERVER_FOLDER / "templates")
+
+    @app.exception_handler(HTTPException)
+    async def http_error(_request, exc: HTTPException):
+        return error(exc.status_code, str(exc.detail))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request, exc: RequestValidationError):
+        first = exc.errors()[0]
+        where = ".".join(str(p) for p in first["loc"] if p != "body")
+        return error(400, f"{where}: {first['msg']}" if where else first["msg"])
+
+    def db_session():
+        with Session(engine) as session:
+            yield session
+
+    def require_login(request: Request):
+        if not request.session.get("logged_in"):
+            raise HTTPException(401, "please log in")
+
+    DB = Annotated[Session, Depends(db_session)]
+
+    # ----- device -----
+
+    @app.post("/api/device/report")
+    async def device_report(request: Request):
+        declared_size = request.headers.get("content-length")
+        if declared_size and declared_size.isdigit() and int(declared_size) > MAX_BODY_BYTES:
+            return error(413, "report too large")
+        body = await request.body()
+        if len(body) > MAX_BODY_BYTES:
+            return error(413, "report too large")
+
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return error(400, "body is not valid JSON")
+        device_id = data.get("device_id") if isinstance(data, dict) else None
+        key = settings.device_keys.get(device_id) if isinstance(device_id, str) else None
+        if key is None:
+            return error(401, "unknown device")
+        signature = request.headers.get("x-signature", "")
+        if not signature:
+            return error(401, "missing X-Signature header")
+        if not signature_is_valid(key, body, signature):
+            log.warning("rejected report with a bad signature for device %s", device_id)
+            return error(401, "bad signature")
+
+        try:
+            report = Report.model_validate(data)
+        except ValidationError as exc:
+            first = exc.errors()[0]
+            return error(400, f"{'.'.join(map(str, first['loc']))}: {first['msg']}")
+
+        saved, level = await run_in_threadpool(save_report, engine, report, body,
+                                               signature.strip().lower(), key.method)
+        return {"ok": True, "saved": saved, "full_level_percent": level}
+
+    # ----- login -----
+
+    @app.get("/login", name="login_page")
+    def login_page(request: Request):
+        return templates.TemplateResponse(request, "login.html", {"error": None})
+
+    @app.post("/login")
+    async def login(request: Request, password: Annotated[str, Form()] = ""):
+        expected = settings.dashboard_password
+        if expected not in ("", EXAMPLE_PASSWORD) and hmac.compare_digest(password.encode(), expected.encode()):
+            request.session.clear()
+            request.session["logged_in"] = True
+            return RedirectResponse("/", status_code=303)
+        await asyncio.sleep(1)
+        message = ("Set DASHBOARD_PASSWORD in server/.env first"
+                   if expected in ("", EXAMPLE_PASSWORD) else "Wrong password")
+        return templates.TemplateResponse(request, "login.html", {"error": message}, status_code=401)
+
+    @app.post("/logout", name="logout")
+    def logout(request: Request):
+        request.session.clear()
+        return RedirectResponse("/login", status_code=303)
+
+    @app.get("/")
+    def dashboard_page(request: Request):
+        if not request.session.get("logged_in"):
+            return RedirectResponse("/login", status_code=303)
+        return templates.TemplateResponse(request, "dashboard.html", {})
+
+    # ----- dashboard API -----
+
+    @app.get("/api/status", dependencies=[Depends(require_login)])
+    def status(session: DB):
+        now = time.time()
+        latest = session.exec(select(Reading).order_by(Reading.created_at.desc()).limit(1)).first()
+        last_message = session.exec(select(func.max(Boot.last_seen))).one()
+
+        def count_opens(since: float, reason: str | None = None) -> int:
+            query = select(func.count()).select_from(Event).where(
+                Event.name == "lid_open", Event.created_at >= since)
+            if reason:
+                query = query.where(Event.detail == reason)
+            return session.exec(query).one()
+
+        boots = session.exec(select(Boot).order_by(Boot.first_seen)).all()
+        level_on_bin = get_setting(session, "level_on_bin")
+        empty_distance = get_setting(session, "empty_distance_cm")
+        today = start_of_today()
+        return {
+            "ok": True,
+            "server_time": now,
+            "online": bool(last_message and now - last_message < OFFLINE_AFTER_SECONDS),
+            "last_message_at": last_message,
+            "full_level_percent": full_level(session),
+            "level_on_bin": int(level_on_bin) if level_on_bin is not None else None,
+            "empty_distance_cm": float(empty_distance) if empty_distance is not None else None,
+            "latest": latest.model_dump() if latest else None,
+            "opens": {
+                "today": count_opens(today),
+                "today_by_hand": count_opens(today, "hand"),
+                "today_by_button": count_opens(today, "button"),
+                "last_24h": count_opens(now - 24 * 3600),
+                "all_time": count_opens(0),
+            },
+            "reboots": max(0, len(boots) - 1),
+            "missing_messages": sum(max(0, b.highest_seq + 1 - b.received_count) for b in boots),
+            "first_seen": boots[0].first_seen if boots else None,
+        }
+
+    @app.get("/api/history", dependencies=[Depends(require_login)])
+    def history(session: DB, hours: float = 24):
+        hours = min(max(hours, 0.25), 24 * 7)
+        since = time.time() - hours * 3600
+        rows = session.exec(
+            select(Reading.created_at, Reading.fill_percent, Reading.hand_cm, Reading.lid_open)
+            .where(Reading.created_at >= since).order_by(Reading.created_at)
+        ).all()
+        step = max(1, math.ceil(len(rows) / MAX_CHART_POINTS))
+        points = [{"created_at": r[0], "fill_percent": r[1], "hand_cm": r[2], "lid_open": r[3]}
+                  for r in rows[::step]]
+
+        bucket_seconds = max(900, int(hours * 3600 / 24))
+        bucket_count = math.ceil(hours * 3600 / bucket_seconds)
+        counts = [0] * bucket_count
+        open_times = session.exec(
+            select(Event.created_at).where(Event.name == "lid_open", Event.created_at >= since)
+        ).all()
+        for t in open_times:
+            index = int((t - since) // bucket_seconds)
+            if 0 <= index < bucket_count:
+                counts[index] += 1
+
+        return {"ok": True, "since": since, "hours": hours, "points": points,
+                "opens": {"bucket_seconds": bucket_seconds, "counts": counts},
+                "full_level_percent": full_level(session)}
+
+    @app.get("/api/events", dependencies=[Depends(require_login)])
+    def recent_events(session: DB, limit: Annotated[int, Query(ge=1, le=200)] = 25):
+        rows = session.exec(select(Event).order_by(Event.created_at.desc()).limit(limit)).all()
+        return {"ok": True, "events": [
+            {"created_at": e.created_at, "name": e.name, "detail": e.detail, "boot_id": e.boot_id}
+            for e in rows]}
+
+    @app.post("/api/settings", dependencies=[Depends(require_login)])
+    def change_settings(update: SettingsUpdate, session: DB):
+        old_level = full_level(session)
+        save_setting(session, "full_level_percent", update.full_level_percent)
+        if update.full_level_percent != old_level:
+            now = time.time()
+            session.add(Event(device_id="dashboard", boot_id="dashboard", seq=None, created_at=now,
+                              received_at=now, name="full_level_set",
+                              detail=f"{old_level}% to {update.full_level_percent}%"))
+        session.commit()
+        return {"ok": True, "full_level_percent": update.full_level_percent}
+
+    return app
 
 
-@app.post("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login_page"))
+app = create_app()
 
 
-@app.get("/")
-@dashboard_login_required
-def dashboard_page():
-    return render_template("dashboard.html")
+if __name__ == "__main__":
+    import uvicorn
 
-
-def start_of_today():
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    return today.timestamp()
-
-
-@app.get("/api/status")
-@dashboard_login_required
-def status():
-    db = get_db()
-    now = time.time()
-    latest = db.execute("SELECT * FROM readings ORDER BY created_at DESC LIMIT 1").fetchone()
-    last_message = db.execute("SELECT MAX(last_seen) AS t FROM boots").fetchone()["t"]
-
-    def count_opens(since, reason=None):
-        sql = "SELECT COUNT(*) AS n FROM events WHERE name = 'lid_open' AND created_at >= ?"
-        values = [since]
-        if reason:
-            sql += " AND detail = ?"
-            values.append(reason)
-        return
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(app, host=app.state.settings.host, port=app.state.settings.port,
+                proxy_headers=True, forwarded_allow_ips="127.0.0.1")
