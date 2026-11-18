@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Servo.h>
 #include <WiFiS3.h>
+#include <SHA256.h>
 #include "secrets.h"
 
 const int HAND_TRIG_PIN = 2;
@@ -218,9 +219,31 @@ int findNumberAfter(const String& text, const String& key) {
   return text.substring(start, end).toInt();
 }
 
+// HMAC-SHA256 of the exact bytes we send, as 64 hex characters.
+// The server recomputes it with the same key to check who sent the report
+// and that nothing was changed on the way.
+String signMessage(const String& message) {
+  const size_t keyLength = strlen(DEVICE_HMAC_KEY);
+  uint8_t digest[32];
+  SHA256 sha;
+  sha.resetHMAC(DEVICE_HMAC_KEY, keyLength);
+  sha.update(message.c_str(), message.length());
+  sha.finalizeHMAC(DEVICE_HMAC_KEY, keyLength, digest, sizeof(digest));
+
+  const char hexDigits[] = "0123456789abcdef";
+  String hex;
+  hex.reserve(64);
+  for (uint8_t b : digest) {
+    hex += hexDigits[b >> 4];
+    hex += hexDigits[b & 0x0F];
+  }
+  return hex;
+}
+
 bool sendReport() {
   int lidOpens = min(lidOpensToSend, MAX_LID_OPENS_PER_MESSAGE);
   String message = buildMessage(lidOpens);
+  String signature = signMessage(message);
 
   WiFiClient client;
   client.setConnectionTimeout(SERVER_TIMEOUT_MS);
@@ -234,6 +257,9 @@ bool sendReport() {
   client.print(SERVER_ADDRESS);
   client.print("\r\n");
   client.print("Content-Type: application/json\r\n");
+  client.print("X-Signature: ");
+  client.print(signature);
+  client.print("\r\n");
   client.print("Content-Length: ");
   client.print(message.length());
   client.print("\r\n");
