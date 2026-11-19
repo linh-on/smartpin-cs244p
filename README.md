@@ -10,14 +10,19 @@ tools/           standalone hardware test sketch (Arduino IDE)
 
 ## Wiring
 
-| Part | Pin | Arduino |
-|------|-----|---------|
-| Hand sensor (HC-SR04) | VCC / GND | 5V / GND |
-| | TRIG / ECHO | D2 / D3 |
-| Fill sensor (HC-SR04, inside the bin, facing down) | VCC / GND | 5V / GND |
-| | TRIG / ECHO | D4 / D5 |
-| Servo | Red / Brown | 5V / GND |
-| | Signal (orange) | D9 |
+| Part | Pin | Wire | Arduino |
+|------|-----|------|---------|
+| Hand sensor (HC-SR04) | VCC | 🔴 | 5V |
+| | TRIG | ⚪ | D2 |
+| | ECHO | 🟣 | D3 |
+| | GND | ⚫ | GND |
+| Fill sensor (HC-SR04, inside the bin, facing down) | VCC | 🟠 | 5V |
+| | TRIG | 🟡 | D4 |
+| | ECHO | 🟢 | D5 |
+| | GND | 🔵 | GND |
+| Servo | VCC | 🔴 | 5V |
+| | Signal | 🟠 | D9 |
+| | GND | 🟤 | GND |
 
 
 ## Firmware
